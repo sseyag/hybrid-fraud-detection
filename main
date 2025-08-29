@@ -1,0 +1,219 @@
+# main.py
+import uvicorn
+import threading
+import time
+from fastapi import FastAPI
+from pydantic import BaseModel
+from collections import defaultdict, deque
+import random
+import uuid
+import math
+import ipaddress
+import numpy as np
+import json
+from sklearn.ensemble import IsolationForest, GradientBoostingClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+# Имитация потока данных (Kafka)
+class EventProducer(threading.Thread):
+    def __init__(self, event_queue):
+        super().__init__()
+        self.event_queue = event_queue
+        self.users = [f"u{i}" for i in range(2000)]
+        self.merchants = [f"m{i}" for i in range(50)]
+        self.countries = ["US", "GB", "KZ", "DE", "IN"]
+        self.daemon = True
+
+    def synth_event(self):
+        user = random.choice(self.users)
+        evt = {
+            "tx_id": str(uuid.uuid4()),
+            "user_id": user,
+            "card_hash": f"c_{hash(user) % 10000}",
+            "amount": round(abs(random.gauss(60, 40)), 2),
+            "currency": "USD",
+            "merchant_id": random.choice(self.merchants),
+            "country": random.choice(self.countries),
+            "ip": str(ipaddress.IPv4Address(random.randint(0, 2**32 - 1))),
+            "device_id": f"d_{random.randint(1, 5000)}",
+            "channel": random.choice(["web", "app", "pos"]),
+            "timestamp": int(time.time())
+        }
+        # Искусственно создаем мошеннические паттерны
+        if random.random() < 0.02:
+            evt["amount"] = round(random.uniform(400, 2000), 2)
+            evt["country"] = "high_risk_geo"
+            if random.random() < 0.5:
+                # Сложный паттерн: несколько пользователей с одного устройства
+                evt["device_id"] = "d_shared_fraud"
+        return evt
+
+    def run(self):
+        while True:
+            self.event_queue.put(self.synth_event())
+            time.sleep(0.005) # ~200 событий/сек
+
+# Построитель признаков и статистический фильтр
+class FeatureBuilder:
+    def __init__(self, window_sec=3600):
+        self.user_data = defaultdict(lambda: {"amounts": deque(maxlen=200), "last_ts": 0})
+        self.merchant_rates = defaultdict(lambda: 0.01)
+
+    def build(self, evt):
+        uid = evt["user_id"]
+        amt = evt["amount"]
+        ts = evt["timestamp"]
+        
+        # Обновляем данные пользователя
+        user_info = self.user_data[uid]
+        user_info["amounts"].append(amt)
+        
+        # Вычисляем признаки
+        amounts = user_info["amounts"]
+        mean = sum(amounts) / len(amounts)
+        std = (sum((x - mean)**2 for x in amounts) / len(amounts))**0.5 if len(amounts) > 1 else 1.0
+        z_score = (amt - mean) / std if std > 0 else 0.0
+        
+        velocity = len(amounts)
+        merchant_prior = self.merchant_rates[evt["merchant_id"]]
+        
+        # Фичи для модели
+        feats = {
+            "amt": amt,
+            "z_user_amt": z_score,
+            "velocity_approx": velocity,
+            "merchant_prior": merchant_prior,
+            "is_high_risk_geo": 1.0 if evt["country"] == "high_risk_geo" else 0.0,
+            "is_shared_device": 1.0 if evt["device_id"] == "d_shared_fraud" else 0.0
+        }
+        
+        # Быстрый статистический флаг для 'triage'
+        fast_flag = (z_score > 3.5) or (feats["is_high_risk_geo"] == 1.0 and amt > 300)
+        return feats, fast_flag
+
+# Гибридная ML-модель
+FEATURE_ORDER = ["amt", "z_user_amt", "velocity_approx", "merchant_prior", "is_high_risk_geo", "is_shared_device"]
+
+class HybridModel:
+    def __init__(self):
+        self.anom = IsolationForest(n_estimators=100, contamination=0.01, random_state=42)
+        self.supervised = Pipeline([
+            ("scaler", StandardScaler()),
+            ("gb", GradientBoostingClassifier(n_estimators=100))
+        ])
+        self.is_fit = False
+        self.anom_data = []
+        self.supervised_data = []
+
+    def fit_unsup(self, X):
+        self.anom.fit(X)
+
+    def fit_supervised(self, X, y):
+        if len(y) > 50:
+            self.supervised.fit(X, y)
+            self.is_fit = True
+            
+    def score_event(self, feat_dict):
+        x = np.array([[feat_dict[k] for k in FEATURE_ORDER]])
+        
+        # Anomaly score (вклад Isolation Forest)
+        anom_score = -self.anom.decision_function(x) if hasattr(self.anom, "decision_function") else np.array([0.0])
+        anom_score_norm = max(0.0, min(1.0, (anom_score[0] + 0.5) / 1.5))
+
+        # Supervised probability
+        if self.is_fit:
+            prob = self.supervised.predict_proba(x)[0, 1]
+        else:
+            prob = 0.5  # Если модель не обучена, даем нейтральный скор
+
+        # Гибридный финальный скор (упрощенная взвешенная сумма)
+        risk = 0.5 * anom_score_norm + 0.5 * prob
+        return max(0.0, min(1.0, risk))
+
+app = FastAPI()
+event_queue = defaultdict(deque)
+model = HybridModel()
+fb = FeatureBuilder()
+
+# In-memory хранилище для обратной связи
+FEEDBACK_BUFFER_X, FEEDBACK_BUFFER_Y, FEEDBACK_BUFFER_U = [], [], []
+
+# Pydantic модель для входящей транзакции
+class Transaction(BaseModel):
+    tx_id: str
+    user_id: str
+    card_hash: str
+    amount: float
+    currency: str
+    merchant_id: str
+    country: str
+    ip: str
+    device_id: str
+    channel: str
+    timestamp: int
+
+# Pydantic модель для обратной связи
+class Feedback(BaseModel):
+    tx_id: str
+    label: int  # 1 - fraud, 0 - legit
+    features: dict
+
+@app.post("/score")
+def score(tx: Transaction):
+    feats, fast_flag = fb.build(tx.dict())
+    risk_score = model.score_event(feats)
+    
+    # Правила Triage
+    T_LOW, T_HIGH = 0.35, 0.75
+    decision = "approve"
+    if fast_flag:
+        risk_score = max(risk_score, 0.6) # Усиливаем риск при срабатывании быстрого фильтра
+    
+    if risk_score >= T_HIGH:
+        decision = "block"
+    elif risk_score >= T_LOW:
+        decision = "step_up"
+    
+    # Возвращаем объяснения (топ-3 фичи по значению)
+    top_factors = sorted(feats.items(), key=lambda item: -abs(item[1]))[:3]
+    
+    return {
+        "tx_id": tx.tx_id,
+        "risk_score": risk_score,
+        "decision": decision,
+        "top_factors": top_factors
+    }
+
+@app.post("/feedback")
+def feedback(fbck: Feedback):
+    features_vector = [fbck.features[k] for k in FEATURE_ORDER]
+    FEEDBACK_BUFFER_U.append(features_vector)
+    
+    # Добавляем размеченные данные в буфер
+    if fbck.label in (0, 1):
+        FEEDBACK_BUFFER_X.append(features_vector)
+        FEEDBACK_BUFFER_Y.append(fbck.label)
+        
+    # Периодическое переобучение моделей
+    if len(FEEDBACK_BUFFER_X) % 100 == 0 and len(FEEDBACK_BUFFER_X) > 0:
+        model.fit_supervised(np.array(FEEDBACK_BUFFER_X), np.array(FEEDBACK_BUFFER_Y))
+        print(f"INFO: Supervised model retrained with {len(FEEDBACK_BUFFER_X)} samples.")
+        
+    if len(FEEDBACK_BUFFER_U) % 200 == 0 and len(FEEDBACK_BUFFER_U) > 0:
+        model.fit_unsup(np.array(FEEDBACK_BUFFER_U))
+        print(f"INFO: Unsupervised model retrained with {len(FEEDBACK_BUFFER_U)} samples.")
+        
+    return {"status": "ok", "labeled_samples": len(FEEDBACK_BUFFER_X), "unlabeled_samples": len(FEEDBACK_BUFFER_U)}
+
+@app.get("/")
+def read_root():
+    return {"status": "Quireon Hybrid Fraud Detection is running"}
+
+if __name__ == "__main__":
+    # Запускаем генератор событий в отдельном потоке
+    producer_thread = EventProducer(event_queue)
+    producer_thread.start()
+    
+    # Запускаем API-сервер
+    uvicorn.run(app, host="0.0.0.0", port=8000)
